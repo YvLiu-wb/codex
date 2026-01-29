@@ -1,13 +1,16 @@
-from datetime import datetime
 import os
 import json
 import re
+from datetime import datetime
+from collections import Counter
 # from qwenvl_class import QwenvlModel
 from Qwen2_5Vl import QwenvlModel
+from qwen2_5_class import QwenModel
 
 
 log = "/home/yvwenqiang/git_package/penrose/py/logs_test/qwen_sft_1_28"
 K_ANSWERS = 3
+K_PERTURB = 3
 
 
 def create_log_folders(base_path):
@@ -52,6 +55,92 @@ def _parse_model_answers(description):
     processed_desc = description.replace("angle ", "∠").replace("_", "")
     return [item.strip() for item in re.split(r"[\n,;]+", processed_desc) if item.strip()]
 
+
+def _extract_option_letter(text):
+    if not text:
+        return None
+    boxed_match = re.findall(r"\{([A-D])\}", text.upper())
+    if boxed_match:
+        return boxed_match[-1]
+    standalone_match = re.findall(r"\b([A-D])\b", text.upper())
+    if standalone_match:
+        return standalone_match[-1]
+    last_match = re.findall(r"[A-D]", text.upper())
+    return last_match[-1] if last_match else None
+
+
+def _normalize_question(text):
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _parse_perturbations(raw_text, limit):
+    candidates = [
+        _normalize_question(item)
+        for item in re.split(r"[\n]+", raw_text)
+        if _normalize_question(item)
+    ]
+    unique = []
+    seen = set()
+    for item in candidates:
+        if item not in seen:
+            unique.append(item)
+            seen.add(item)
+        if len(unique) >= limit:
+            break
+    return unique
+
+
+def generate_perturbations(model, question, k):
+    prompt = (
+        "请对以下问题进行语义等价的改写，保持题意与选项不变，"
+        f"生成{k}个不同表述的版本。只输出每个版本一行，不要编号或额外说明。\n"
+        f"问题：{question}"
+    )
+    response = model.generate_response(prompt)
+    perturbations = _parse_perturbations(response, k)
+    return perturbations
+
+
+def build_question_message(question, image_path, image_examples):
+    message = [
+        {
+            "role": "system",
+            "content": (
+                "According to the picture, answer the question. "
+                "Note that when referring to angles in the answer, "
+                "you must use the symbol ∠. "
+                f"Return {K_ANSWERS} distinct answers separated by commas, "
+                "and do not add any extra text."
+            ),
+        },
+    ]
+    message.extend(image_examples)
+    message.append(
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": question},
+                {"type": "image", "image": f"file://{image_path}"},
+            ],
+        }
+    )
+    return message
+
+
+def choose_voted_answer(answer_candidates, fallback_answer):
+    option_candidates = [_extract_option_letter(item) for item in answer_candidates]
+    option_candidates = [item for item in option_candidates if item]
+    if not option_candidates:
+        return _extract_option_letter(fallback_answer)
+    counts = Counter(option_candidates)
+    most_common = counts.most_common()
+    if most_common and most_common[0][1] > 1:
+        top_count = most_common[0][1]
+        top_answers = [item for item, count in most_common if count == top_count]
+        if len(top_answers) == 1:
+            return top_answers[0]
+        return _extract_option_letter(fallback_answer)
+    return _extract_option_letter(fallback_answer)
 
 
 def is_correct_answer(answer, description):
@@ -110,6 +199,7 @@ def log_summary(log_base_path, question_type_counts):
 
 def process_json_files(folder_path):
     model = QwenvlModel()
+    perturb_model = QwenModel()
     correct_count = 0
     total_count = 0
 
@@ -142,17 +232,7 @@ def process_json_files(folder_path):
                 question_id = data.get("id")  # Assuming there's an id field
 
                 if all([image_path, question, answer, question_type, question_id]):
-                    message = [
-                        {
-                            "role": "system",
-                            "content": (
-                                "According to the picture, answer the question. "
-                                "Note that when referring to angles in the answer, "
-                                "you must use the symbol ∠. "
-                                f"Return {K_ANSWERS} distinct answers separated by commas, "
-                                "and do not add any extra text."
-                            ),
-                        },
+                    image_examples = [
                         {
                             "role": "user",
                             "content": [
@@ -186,17 +266,24 @@ def process_json_files(folder_path):
                             ],
                         },
                         {"role": "assistant", "content": "∠BAC"},
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": question},
-                                {"type": "image", "image": f"file://{image_path}"},
-                            ],
-                        },
                     ]
-                    description = model.generate(messages=message)
-                    # Check if the description contains any of the answers
-                    is_correct = is_correct_answer(answer, description)
+                    perturb_questions = generate_perturbations(perturb_model, question, K_PERTURB)
+                    question_variants = [question] + [
+                        item for item in perturb_questions if item != question
+                    ]
+                    model_answers = []
+                    for variant in question_variants:
+                        message = build_question_message(variant, image_path, image_examples)
+                        description = model.generate(messages=message)
+                        model_answers.append(description)
+
+                    voted_answer = choose_voted_answer(model_answers, model_answers[0])
+                    correct_option = _extract_option_letter(answer)
+                    is_correct = (
+                        voted_answer == correct_option
+                        if correct_option
+                        else is_correct_answer(answer, ",".join(model_answers))
+                    )
                     question_type_counts[question_type]["total"] += 1
 
                     if is_correct:
@@ -207,7 +294,16 @@ def process_json_files(folder_path):
                             question_id,
                             question,
                             answer,
-                            description,
+                            json.dumps(
+                                {
+                                    "original_question": question,
+                                    "perturbations": perturb_questions,
+                                    "model_answers": model_answers,
+                                    "voted_answer": voted_answer,
+                                },
+                                ensure_ascii=False,
+                                indent=2,
+                            ),
                             log_base_path,
                             question_type,
                         )
@@ -217,7 +313,16 @@ def process_json_files(folder_path):
                             question_id,
                             question,
                             answer,
-                            description,
+                            json.dumps(
+                                {
+                                    "original_question": question,
+                                    "perturbations": perturb_questions,
+                                    "model_answers": model_answers,
+                                    "voted_answer": voted_answer,
+                                },
+                                ensure_ascii=False,
+                                indent=2,
+                            ),
                             log_base_path,
                             question_type,
                         )
